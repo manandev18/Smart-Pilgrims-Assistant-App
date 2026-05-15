@@ -1,5 +1,6 @@
 import { Server } from 'socket.io';
 import jwt from 'jsonwebtoken';
+import axios from 'axios';
 import LocationLog from '../models/LocationLog.js';
 import GuardianMapping from '../models/GuardianMapping.js';
 import SOSAlert from '../models/SOSAlert.js';
@@ -7,9 +8,26 @@ import Client from '../models/client.js';
 import { sendSOSEmail } from '../utils/emailService.js';
 
 const userSocketMap = new Map(); // userId -> socketId
+const lastSavedPosMap = new Map(); // userId -> {lat, lng}
+
+// Haversine distance helper (metres)
+const getDistance = (lat1, lon1, lat2, lon2) => {
+    const R = 6371e3;
+    const φ1 = lat1 * Math.PI / 180;
+    const φ2 = lat2 * Math.PI / 180;
+    const Δφ = (lat2 - lat1) * Math.PI / 180;
+    const Δλ = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+              Math.cos(φ1) * Math.cos(φ2) *
+              Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+};
 
 export const initSocket = (server) => {
     const io = new Server(server, {
+        pingTimeout: 30000,
+        pingInterval: 10000,
         cors: {
             origin: "*", // Adjust this in production
             methods: ["GET", "POST"]
@@ -57,10 +75,17 @@ export const initSocket = (server) => {
                     io.to(`user_${mapping.guardian_id}`).emit('receiveLocation', payload);
                 });
 
-                // 3. Save to DB async (non-blocking — don't make guardian wait for this)
-                LocationLog.create({ user_id: userId, lat, lng }).catch(e => 
-                    console.error('Location log save error:', e.message)
-                );
+                // 3. Save to DB async (non-blocking) — only if user moved > 10m
+                const lastPos = lastSavedPosMap.get(userId);
+                const distanceMoved = lastPos ? getDistance(lastPos.lat, lastPos.lng, lat, lng) : Infinity;
+
+                if (distanceMoved >= 10) {
+                    LocationLog.create({ user_id: userId, lat, lng })
+                        .then(() => {
+                            lastSavedPosMap.set(userId, { lat, lng });
+                        })
+                        .catch(e => console.error('Location log save error:', e.message));
+                }
 
             } catch (error) {
                 console.error('Error processing location update:', error);
@@ -80,10 +105,31 @@ export const initSocket = (server) => {
                     status: 'active'
                 });
 
-                // 2. Get User Info
+                // 3. Get User Info
                 const user = await Client.findByPk(userId);
 
-                // 3. Notify Guardians
+                // 3a. Fetch Nearby Emergency Services (Police & Hospital)
+                let nearbyServices = [];
+                try {
+                    const apiKey = process.env.GEOAPIFY_API_KEY;
+                    if (apiKey) {
+                        const categories = 'healthcare.hospital,service.police';
+                        const url = `https://api.geoapify.com/v2/places?categories=${categories}&filter=circle:${lng},${lat},5000&bias=proximity:${lng},${lat}&limit=5&apiKey=${apiKey}`;
+                        const geoRes = await axios.get(url);
+                        nearbyServices = geoRes.data.features.map(f => ({
+                            name: f.properties.name || f.properties.street || 'Emergency Unit',
+                            address: f.properties.address_line2 || f.properties.formatted,
+                            lat: f.properties.lat,
+                            lng: f.properties.lon,
+                            category: f.properties.categories.includes('healthcare') ? 'hospital' : 'police',
+                            distance: f.properties.distance
+                        }));
+                    }
+                } catch (geoErr) {
+                    console.error('Nearby services fetch failed:', geoErr.message);
+                }
+
+                // 4. Notify Guardians
                 const mappings = await GuardianMapping.findAll({
                     where: { user_id: userId, is_approved: true },
                     attributes: ['guardian_id']
@@ -95,6 +141,7 @@ export const initSocket = (server) => {
                     userName: user.name,
                     lat,
                     lng,
+                    nearbyServices,
                     timestamp: new Date()
                 };
 
@@ -102,16 +149,16 @@ export const initSocket = (server) => {
                     io.to(`user_${mapping.guardian_id}`).emit('SOS_RECEIVED', alertData);
                 });
 
-                // 4. Notify Admins (broadcast to an 'admins' room or just broadcast)
+                // 5. Notify Admins
                 io.emit('SOS_ADMIN_ALERT', alertData);
 
-                // 5. Send Email Alert in background (non-blocking)
+                // 6. Send Email Alert in background
                 const adminEmail = process.env.ADMIN_EMAIL || process.env.SMTP_USER;
                 if (adminEmail) {
                     sendSOSEmail(adminEmail, {
                         user,
                         location: { lat, lng },
-                        nearbyServices: [] // Optional: fetch nearby services later if needed
+                        nearbyServices
                     }).catch(emailErr => console.error('SOS Email failed:', emailErr.message));
                 }
 

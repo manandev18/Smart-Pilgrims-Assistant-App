@@ -11,17 +11,37 @@ export const SocketProvider = ({ children }) => {
     const [sosAlerts, setSosAlerts] = useState([]);
     const [activeTrackingSesssion, setActiveTrackingSession] = useState(null); // When looking at someone
     const [myActiveSession, setMyActiveSession] = useState(null); // When I am being tracked
+    const [isConnected, setIsConnected] = useState(false);
 
     useEffect(() => {
         const token = localStorage.getItem('token');
         if (!token) return;
 
         const newSocket = io(import.meta.env.VITE_API_URL || 'http://localhost:3001', {
-            auth: { token }
+            auth: { token },
+            reconnection: true,
+            reconnectionAttempts: 10,
+            reconnectionDelay: 2000
         });
 
         newSocket.on('connect', () => {
             console.log('Connected to socket server');
+            setIsConnected(true);
+            
+            // Re-sync session if we were tracking (use local var to avoid closure stale state)
+            const savedSession = JSON.parse(localStorage.getItem('active_session'));
+            if (savedSession) {
+                newSocket.emit('startTracking', savedSession);
+            }
+        });
+
+        newSocket.on('disconnect', () => {
+            console.log('Disconnected from socket server');
+            setIsConnected(false);
+        });
+
+        newSocket.on('connect_error', () => {
+            setIsConnected(false);
         });
 
         newSocket.on('receiveLocation', (data) => {
@@ -74,8 +94,10 @@ export const SocketProvider = ({ children }) => {
 
     const startTracking = (guardianId, src, dest) => {
         if (socket) {
-            socket.emit('startTracking', { guardianId, src, dest });
-            setMyActiveSession({ guardianId, src, dest });
+            const session = { guardianId, src, dest };
+            socket.emit('startTracking', session);
+            setMyActiveSession(session);
+            localStorage.setItem('active_session', JSON.stringify(session));
         }
     };
 
@@ -83,12 +105,13 @@ export const SocketProvider = ({ children }) => {
         if (socket) {
             socket.emit('stopTracking', { guardianId });
             setMyActiveSession(null);
+            localStorage.removeItem('active_session');
         }
     };
 
     return (
         <SocketContext.Provider value={{ 
-            socket, lastLocation, sosAlerts, activeTrackingSesssion, myActiveSession, 
+            socket, isConnected, lastLocation, sosAlerts, activeTrackingSesssion, myActiveSession, 
             sendLocation, triggerSOS, startTracking, stopTracking 
         }}>
             {children}
